@@ -1,71 +1,122 @@
 import os 
 import uuid
-from pinecone import Pinecone as pine
-import goggle.generativeai as genai
+from pinecone import Pinecone 
+import google.generativeai as genai
 from dotenv import load_dotenv
+from simplegmail import Gmail
+from simplegmail.query import construct_query
 
 load_dotenv()
 
-# GMAIL RAG
+# Configure APIs
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 
-pine.init(
-    api_key=os.getenv("PINECONE_API_KEY"),
-    environment=os.getenv("PINECONE_ENVIRONMENT")
-)
+# Initialize Gmail
+gmail = Gmail()
 
-
-index_name = "quickstart-py"
-if not pine.has_index(index_name):
-    pine.create_index_for_model(
+# Setup Pinecone index
+index_name = "gmail-rag-index"
+if not pc.has_index(index_name):
+    pc.create_index_for_model(
         name=index_name,
         cloud="aws",
         region="us-east-1",
         embed={
             "model":"llama-text-embed-v2",
-            "field_map":{"text": "chunk_text"}
+            "field_map":{"text": "text"} 
         }
     )
 
-
-# def embed_text(text, task="RETRIEVAL_DOCUMENT"):
-#     return genai.embed_text(
-#         text=text,
-#         model="text-embedding-004",
-#         task=task
-#     )["embedding"]
+index = pc.Index(index_name)
 
 
-#pinecone here
+def format_messages(message):
+    # need to format message content dfso i can chunk it
+    print("yo mama")
 
+def fetch_and_upsert_emails():
+    
+    query_params = {
+        "newer_than": "5d",  
+        "unread": True,   
+    }
+    
+    messages = gmail.get_messages(query=construct_query(query_params))
+    
+    email_records = []
+    
+    for message in messages:
+        print("This is the message: ", message)
+        email_content = f"""
+        Body: {message.plain or message.snippet or 'No content'}
+        """
+        record = {
+            "_id": f"email_{message.id}",
+            "text": email_content.strip(),
+            "subject": message.subject or 'No Subject',
+            "sender": message.sender or 'Unknown Sender',
+            "date": str(message.date) if message.date else 'Unknown Date',
+            "message_id": message.id,
+        }
+        print(f"Snippet: {message.snippet}")
+        email_records.append(record)
+        
 
-# # Step 1: Add 2 emails
-# emails = {
-#     "email1": "Hi John, just a reminder about the team meeting on Tuesday at 3pm. Let me know if you need slides.",
-#     "email2": "Dear client, your subscription will expire in 3 days. Please renew to avoid service interruption."
-# }
+    if email_records:
+        print(f"🔄 Upserting {len(email_records)} emails to Pinecone...")
 
-# for key, text in emails.items():
-#     embedding = embed_text(text)
-#     index.upsert([
-#         (str(uuid.uuid4()), embedding, {"text": text, "email_id": key})
-#     ])
+        batch_size = 5
+        for i in range(0, len(email_records), batch_size):
+            batch = email_records[i:i + batch_size]
+            index.upsert_records("gmail-namespace", batch)
+            print(f"✅ Upserted batch {i//batch_size + 1}")
+        
+        print(f"✅ All {len(email_records)} emails embedded in Pinecone!")
+    else:
+        print("❌ No emails found to upsert.")
+    
+    return len(email_records)
 
-# print("✅ Emails embedded in Pinecone.")
+def query_emails(user_query):
+    """Query emails using RAG"""
+    try:
 
-# # Step 2: Accept query and run RAG
-# model = genai.GenerativeModel("gemini-pro")
+        query_embedding = genai.embed_content(
+            model="models/embedding-001",
+            content=user_query,
+            task_type="RETRIEVAL_QUERY"
+        )["embedding"]
+        
 
-# while True:
-#     query = input("\n🔍 Ask something (or leave blank to quit): ")
-#     if not query.strip():
-#         break
+        results = index.query(
+            vector=query_embedding,
+            top_k=5,
+            include_metadata=True,
+            namespace="gmail-namespace"
+        )
+        
+        if results["matches"]:
+            contexts = []
+            for match in results["matches"]:
+                contexts.append({
+                    "text": match["metadata"]["text"],
+                    "subject": match["metadata"]["subject"],
+                    "sender": match["metadata"]["sender"],
+                    "score": match["score"]
+                })
+            
+            return contexts
+        else:
+            return []
+            
+    except Exception as e:
+        print(f"❌ Query error: {e}")
+        return []
 
-#     query_embedding = embed_text(query, task="RETRIEVAL_QUERY")
+if __name__ == "__main__":
 
-#     results = index.query(vector=query_embedding, top_k=1, include_metadata=True)
-#     context = results["matches"][0]["metadata"]["text"]
-#     print(f"\n📚 Retrieved Context: {context}")
-
-#     prompt = f"Context:\n{context}\n\nQuestion:\n{query}"
-#     response = model.generate_content(prompt)
-#     print(f"\n🤖 Gemini: {response.text}")
+    email_count = fetch_and_upsert_emails()
+    
+    if email_count > 0:
+        print(f"✅ Successfully processed {email_count} emails.")
